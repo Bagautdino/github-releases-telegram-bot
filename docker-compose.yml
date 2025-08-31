@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  tg-release-bot:
+    build: .
+    container_name: tg-release-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/releases.db
+    healthcheck:
+      test: ["CMD", "pgrep", "tg-release-bot"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
