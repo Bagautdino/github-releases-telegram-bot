@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var bulletRe = regexp.MustCompile(`(?m)^\s*[-*•]\s+(.+)$`)
@@ -62,14 +63,16 @@ func BuildHTML(in Input, opt Options) string {
 	}
 
 	// Ссылка на changelog
-	sb.WriteString(`\n<a href="` + in.URL + `">📖 Полный changelog</a>`)
+	sb.WriteString("\n<a href=\"" + in.URL + "\">📖 Полный changelog</a>")
 
 	// LLM совет более компактно
 	if strings.TrimSpace(in.Advisor) != "" {
 		sb.WriteString("\n\n💡 " + html.EscapeString(in.Advisor))
 	}
 
-	return sb.String()
+	// Ensure the final message is valid UTF-8
+	result := sb.String()
+	return sanitizeUTF8(result)
 }
 
 func min(a, b int) int {
@@ -191,6 +194,9 @@ func extractParagraphs(md string, maxBullets, maxChars int) []string {
 
 // stripFormatting removes markdown formatting and escapes HTML
 func stripFormatting(s string) string {
+	// First ensure valid UTF-8
+	s = sanitizeUTF8(s)
+	
 	// Remove common markdown syntax
 	s = strings.ReplaceAll(s, "`", "")
 	s = regexp.MustCompile(`[_*~#>]+`).ReplaceAllString(s, "")
@@ -205,6 +211,56 @@ func stripFormatting(s string) string {
 	s = html.EscapeString(s)
 
 	return s
+}
+
+// sanitizeUTF8 removes invalid UTF-8 sequences and problematic characters
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		// String is valid UTF-8, but might contain problematic characters
+		return cleanProblematicChars(s)
+	}
+	
+	// Fix invalid UTF-8 by converting to valid runes
+	var builder strings.Builder
+	for _, r := range s {
+		if r == utf8.RuneError {
+			// Skip invalid runes
+			continue
+		}
+		if isAllowedRune(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+// cleanProblematicChars removes characters that can cause issues with Telegram
+func cleanProblematicChars(s string) string {
+	var builder strings.Builder
+	for _, r := range s {
+		if isAllowedRune(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+// isAllowedRune checks if a rune is safe for Telegram messages
+func isAllowedRune(r rune) bool {
+	// Allow basic ASCII, most Unicode text, and common symbols
+	if r < 32 && r != '\t' && r != '\n' && r != '\r' {
+		return false // Control characters except tab, newline, carriage return
+	}
+	
+	// Block some problematic Unicode ranges
+	if r >= 0xFDD0 && r <= 0xFDEF {
+		return false // Non-characters
+	}
+	if (r&0xFFFF) >= 0xFFFE {
+		return false // Non-characters ending in FFFE or FFFF
+	}
+	
+	return true
 }
 
 // isAllCaps checks if string is mostly uppercase (likely a header)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -97,6 +98,12 @@ func main() {
 		if err != nil {
 			logger.Warn("Failed to add default chat", "chat_id", cfg.DefaultChatID, "error", err)
 		}
+	}
+
+	// Initialize repositories from environment configuration
+	if err := initializeRepositories(ctx, logger, store, cfg); err != nil {
+		logger.Error("Failed to initialize repositories", "error", err)
+		// Don't exit - this is not critical, repositories can be added later via bot commands
 	}
 
 	logger.Info("Bot started successfully",
@@ -225,10 +232,50 @@ func processRepository(
 
 	logger.Debug("Processed releases", "total", len(resp.Releases), "filtered", len(releases))
 
-	// Process each release
+	// Process each release (limit to recent releases to avoid spam)
+	now := time.Now()
+	cutoffDate := now.AddDate(0, 0, -cfg.MaxReleaseAgeDays)
+	
 	for _, release := range releases {
+		// Skip releases older than configured age to avoid processing too many old releases
+		if release.PublishedAt.Before(cutoffDate) {
+			releaseLogger := logger.With("release_id", release.ID, "tag", release.TagName)
+			releaseLogger.Debug("Skipping old release", "published_at", release.PublishedAt, "max_age_days", cfg.MaxReleaseAgeDays)
+			
+			// Mark old releases as processed to avoid future processing
+			if err := store.MarkProcessed(ctx, repo.Owner, repo.Name, release.ID, release.TagName, release.PublishedAt); err != nil {
+				releaseLogger.Warn("Failed to mark old release as processed", "error", err)
+			}
+			continue
+		}
+		
 		processRelease(ctx, logger, store, telegramSender, advisorClient, cfg, repo, release)
 	}
+}
+
+// isPermanentTelegramError checks if a Telegram error is permanent and chat should be removed
+func isPermanentTelegramError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := strings.ToLower(err.Error())
+	
+	// These errors indicate permanent issues with the chat
+	permanentErrors := []string{
+		"chat not found",
+		"bot was blocked by the user",
+		"user is deactivated",
+		"forbidden",
+	}
+	
+	for _, permErr := range permanentErrors {
+		if strings.Contains(errStr, permErr) {
+			return true
+		}
+	}
+	
+	return false
 }
 
 // processRelease processes a single release
@@ -265,9 +312,18 @@ func processRelease(
 	var advice string
 	if advisorClient != nil {
 		repoName := fmt.Sprintf("%s/%s", repo.Owner, repo.Name)
-		advice, err = advisorClient.Advise(ctx, repoName, release.TagName, bullets)
+		
+		// Create a timeout context for LLM requests to avoid blocking the whole process
+		llmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		
+		advice, err = advisorClient.Advise(llmCtx, repoName, release.TagName, bullets)
 		if err != nil {
-			releaseLogger.Warn("Failed to get LLM advice", "error", err)
+			if isLLMTimeoutError(err) {
+				releaseLogger.Debug("LLM request timed out, continuing without advice", "error", err)
+			} else {
+				releaseLogger.Warn("Failed to get LLM advice", "error", err)
+			}
 			// Continue without advice - don't fail the whole process
 		}
 	}
@@ -303,6 +359,16 @@ func processRelease(
 
 			if err := telegramSender.SendHTML(ctx, chat.ID, msg); err != nil {
 				chatLogger.Error("Failed to send message", "error", err)
+				
+				// Handle permanent errors by removing invalid chats
+				if isPermanentTelegramError(err) {
+					chatLogger.Warn("Removing chat due to permanent error", "error", err)
+					if removeErr := store.RemoveChat(ctx, chat.ID); removeErr != nil {
+						chatLogger.Error("Failed to remove invalid chat", "remove_error", removeErr)
+					} else {
+						chatLogger.Info("Invalid chat removed from database")
+					}
+				}
 			} else {
 				chatLogger.Info("Message sent successfully")
 			}
@@ -326,4 +392,57 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// initializeRepositories adds repositories from environment configuration to the store
+func initializeRepositories(ctx context.Context, logger *slog.Logger, store *db.Store, cfg *config.Config) error {
+	if len(cfg.InitialRepositories) == 0 {
+		logger.Debug("No initial repositories configured in environment")
+		return nil
+	}
+
+	logger.Info("Initializing repositories from environment configuration", "count", len(cfg.InitialRepositories))
+
+	for _, repo := range cfg.InitialRepositories {
+		repoLogger := logger.With("repo", fmt.Sprintf("%s/%s", repo.Owner, repo.Name))
+		
+		err := store.AddRepository(ctx, repo.Owner, repo.Name, repo.TrackPrereleases)
+		if err != nil {
+			repoLogger.Warn("Failed to add repository from environment", "error", err)
+			continue
+		}
+		
+		prereText := ""
+		if repo.TrackPrereleases {
+			prereText = " (including prereleases)"
+		}
+		repoLogger.Info("Repository added from environment configuration" + prereText)
+	}
+
+	return nil
+}
+
+// isLLMTimeoutError checks if an error is related to LLM timeout
+func isLLMTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := strings.ToLower(err.Error())
+	
+	// Common timeout-related error messages
+	timeoutErrors := []string{
+		"context deadline exceeded",
+		"timeout",
+		"client.timeout",
+		"i/o timeout",
+	}
+	
+	for _, timeoutErr := range timeoutErrors {
+		if strings.Contains(errStr, timeoutErr) {
+			return true
+		}
+	}
+	
+	return false
 }

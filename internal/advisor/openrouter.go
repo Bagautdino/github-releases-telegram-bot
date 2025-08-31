@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -26,7 +27,7 @@ func New(apiKey, model string) *Client {
 		model:   model,
 		baseURL: "https://openrouter.ai/api/v1",
 		http: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 20 * time.Second, // Увеличили timeout с 10 до 20 секунд
 		},
 	}
 }
@@ -73,11 +74,11 @@ func (c *Client) Advise(ctx context.Context, repo, tag string, bullets []string)
 
 	req := Request{
 		Model:     c.model,
-		MaxTokens: 200,
+		MaxTokens: 350, // Увеличили с 200 до 350 для более полных ответов
 		Messages: []Message{
 			{
 				Role:    "system",
-				Content: "Ты опытный технический эксперт. Анализируешь релизы ПО для разработчиков. Отвечай ТОЛЬКО на русском языке, максимально сухо и конкретно. Никакого маркетинга - только реальная практическая польза для инженеров.",
+				Content: "Ты опытный DevOps инженер. Анализируешь релизы для разработчиков. Отвечай СТРОГО в формате:\n\n🔧 КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ:\n• [конкретное изменение]\n• [конкретное изменение]\n\n⚠️ ВАЖНО:\n• [что важно знать при обновлении]\n\nОтвечай кратко, максимум 3-4 пункта. БЕЗ заголовков, БЕЗ нумерации, БЕЗ лишнего текста. Только практическая польза для инженеров.",
 			},
 			{
 				Role:    "user",
@@ -93,16 +94,12 @@ func (c *Client) Advise(ctx context.Context, repo, tag string, bullets []string)
 func (c *Client) buildPrompt(repo, tag string, bullets []string) string {
 	bulletsText := strings.Join(bullets, "; ")
 	
-	return fmt.Sprintf(`Проанализируй релиз %s %s. Напиши на русском языке краткий анализ (максимум 120 слов):
+	return fmt.Sprintf(`Релиз: %s %s
 
-Изменения: %s
+Изменения:
+%s
 
-Напиши только практическую пользу:
-1. Что конкретно улучшилось для разработчиков
-2. Стоит ли обновляться и почему
-3. Есть ли проблемы при обновлении
-
-Пиши сухо и технично, как эксперт для инженеров. Без маркетинга и воды.`, repo, tag, bulletsText)
+Проанализируй что важно для DevOps/разработчиков. Следуй СТРОГО формату из system prompt.`, repo, tag, bulletsText)
 }
 
 // makeRequest sends a request to OpenRouter API
@@ -150,10 +147,82 @@ func (c *Client) makeRequest(ctx context.Context, req Request) (string, error) {
 
 	content := strings.TrimSpace(response.Choices[0].Message.Content)
 
-	// Limit response length for Telegram
-	if len(content) > 400 {
-		content = content[:400] + "…"
-	}
+	// Format and limit response length for Telegram
+	content = formatLLMResponse(content)
 
 	return content, nil
+}
+
+// formatLLMResponse cleans up and formats LLM response for better readability
+func formatLLMResponse(content string) string {
+	if content == "" {
+		return ""
+	}
+	
+	// Clean up common formatting issues
+	content = strings.ReplaceAll(content, "**", "") // Remove markdown bold
+	content = strings.ReplaceAll(content, "*", "")  // Remove markdown italic
+	content = strings.ReplaceAll(content, "#", "")  // Remove markdown headers
+	
+	// Fix common issues with numbered lists
+	content = regexp.MustCompile(`(?m)^\s*(\d+)\.\s*`).ReplaceAllString(content, "$1. ")
+	
+	// Clean up extra whitespace
+	content = regexp.MustCompile(`\s+`).ReplaceAllString(content, " ")
+	content = regexp.MustCompile(`\n\s*\n`).ReplaceAllString(content, "\n")
+	
+	// Remove common LLM artifacts and clean up formatting
+	content = strings.ReplaceAll(content, "Анализ релиз-нот", "")
+	content = strings.ReplaceAll(content, "Анализ релиза", "")
+	content = regexp.MustCompile(`(?i)^##\s*`).ReplaceAllString(content, "")
+	
+	// Clean up emoji formatting and ensure proper spacing
+	content = regexp.MustCompile(`🔧\s*`).ReplaceAllString(content, "🔧 ")
+	content = regexp.MustCompile(`⚠️\s*`).ReplaceAllString(content, "⚠️ ")
+	content = regexp.MustCompile(`•\s*`).ReplaceAllString(content, "• ")
+	
+	// Remove duplicate spaces around structured elements
+	content = regexp.MustCompile(`\s*🔧\s*`).ReplaceAllString(content, "\n🔧 ")
+	content = regexp.MustCompile(`\s*⚠️\s*`).ReplaceAllString(content, "\n\n⚠️ ")
+	content = regexp.MustCompile(`\s*•\s*`).ReplaceAllString(content, "\n• ")
+	
+	// Trim and ensure proper structure
+	content = strings.TrimSpace(content)
+	
+	// Smart truncation - try to cut at sentence boundary
+	maxLength := 600 // Увеличили с 400 до 600
+	if len(content) > maxLength {
+		// Try to cut at sentence end
+		sentences := strings.Split(content, ". ")
+		truncated := ""
+		
+		for _, sentence := range sentences {
+			test := truncated + sentence + ". "
+			if len(test) > maxLength-10 { // Leave some margin
+				break
+			}
+			truncated = test
+		}
+		
+		if truncated != "" {
+			content = strings.TrimSpace(truncated)
+			if !strings.HasSuffix(content, ".") {
+				content += "."
+			}
+		} else {
+			// Fallback: cut at word boundary
+			words := strings.Fields(content)
+			truncated = ""
+			for _, word := range words {
+				test := truncated + " " + word
+				if len(test) > maxLength-10 {
+					break
+				}
+				truncated = test
+			}
+			content = strings.TrimSpace(truncated) + "…"
+		}
+	}
+	
+	return content
 }

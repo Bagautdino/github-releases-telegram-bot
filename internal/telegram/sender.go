@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -41,8 +42,13 @@ func (s *Sender) SendHTML(ctx context.Context, chatID int64, html string) error 
 			}
 
 			lastErr = err
+			
+			// Check if error is permanent (don't retry these)
+			if isPermanentError(err) {
+				return fmt.Errorf("permanent telegram error: %w", err)
+			}
 
-			// Exponential backoff
+			// Exponential backoff for retryable errors
 			if attempt < 2 {
 				backoff := time.Duration(500*(attempt+1)) * time.Millisecond
 				select {
@@ -129,4 +135,32 @@ func findBreakPoint(text string, maxSize int) int {
 	}
 
 	return -1 // No good break point found
+}
+
+// isPermanentError checks if a Telegram API error is permanent and shouldn't be retried
+func isPermanentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := strings.ToLower(err.Error())
+	
+	// These errors indicate permanent issues that won't be fixed by retrying
+	permanentErrors := []string{
+		"chat not found",
+		"bot was blocked by the user",
+		"user is deactivated",
+		"text must be encoded in utf-8",
+		"message is too long",
+		"bad request: can't parse entities",
+		"forbidden",
+	}
+	
+	for _, permErr := range permanentErrors {
+		if strings.Contains(errStr, permErr) {
+			return true
+		}
+	}
+	
+	return false
 }

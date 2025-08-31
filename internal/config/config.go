@@ -7,32 +7,43 @@ import (
 )
 
 type Config struct {
-	GithubToken       string
-	TelegramToken     string
-	DefaultChatID     int64
-	IntervalMinutes   int
-	TimeZone          string
-	AdvisorEnabled    bool
-	OpenRouterAPIKey  string
-	OpenRouterModel   string
-	AllowedUserIDs    []int64
-	MaxChangelogChars int
-	MaxBullets        int
+	GithubToken         string
+	TelegramToken       string
+	DefaultChatID       int64
+	IntervalMinutes     int
+	TimeZone            string
+	AdvisorEnabled      bool
+	OpenRouterAPIKey    string
+	OpenRouterModel     string
+	AllowedUserIDs      []int64
+	MaxChangelogChars   int
+	MaxBullets          int
+	InitialRepositories []Repository
+	MaxReleaseAgeDays   int
+}
+
+// Repository represents a repository configuration from environment
+type Repository struct {
+	Owner            string
+	Name             string
+	TrackPrereleases bool
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		GithubToken:       mustGetEnv("GITHUB_TOKEN"),
-		TelegramToken:     mustGetEnv("TELEGRAM_BOT_TOKEN"),
-		DefaultChatID:     parseInt64(getEnv("DEFAULT_CHAT_ID", "0")),
-		IntervalMinutes:   parseInt(getEnv("POLL_INTERVAL_MINUTES", "10")),
-		TimeZone:          getEnv("TIMEZONE", "Europe/Amsterdam"),
-		AdvisorEnabled:    getEnv("ADVISOR_ENABLED", "0") == "1",
-		OpenRouterAPIKey:  getEnv("OPENROUTER_API_KEY", ""),
-		OpenRouterModel:   getEnv("OPENROUTER_MODEL", "openrouter/anthropic/claude-3-haiku"),
-		AllowedUserIDs:    parseUserIDs(getEnv("ALLOWED_USER_IDS", "")),
-		MaxChangelogChars: parseInt(getEnv("MAX_CHANGELOG_CHARS", "2500")),
-		MaxBullets:        parseInt(getEnv("MAX_BULLETS", "8")),
+		GithubToken:         mustGetEnv("GITHUB_TOKEN"),
+		TelegramToken:       mustGetEnv("TELEGRAM_BOT_TOKEN"),
+		DefaultChatID:       parseInt64(getEnv("DEFAULT_CHAT_ID", "0")),
+		IntervalMinutes:     parseInt(getEnv("POLL_INTERVAL_MINUTES", "10")),
+		TimeZone:            getEnv("TIMEZONE", "Europe/Amsterdam"),
+		AdvisorEnabled:      getEnv("ADVISOR_ENABLED", "0") == "1",
+		OpenRouterAPIKey:    getEnv("OPENROUTER_API_KEY", ""),
+		OpenRouterModel:     getEnv("OPENROUTER_MODEL", "openrouter/anthropic/claude-3-haiku"),
+		AllowedUserIDs:      parseUserIDs(getEnv("ALLOWED_USER_IDS", "")),
+		MaxChangelogChars:   parseInt(getEnv("MAX_CHANGELOG_CHARS", "2500")),
+		MaxBullets:          parseInt(getEnv("MAX_BULLETS", "8")),
+		InitialRepositories: parseRepositories(getEnv("INITIAL_REPOSITORIES", "")),
+		MaxReleaseAgeDays:   parseInt(getEnv("MAX_RELEASE_AGE_DAYS", "30")),
 	}
 
 	return cfg, nil
@@ -82,4 +93,44 @@ func parseUserIDs(s string) []int64 {
 		}
 	}
 	return ids
+}
+
+// parseRepositories parses comma-separated list of repositories from environment variable
+// Format: "owner/repo:pre,owner2/repo2,owner3/repo3:pre"
+// The ":pre" suffix indicates that prereleases should be tracked
+func parseRepositories(s string) []Repository {
+	if s == "" {
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+	var repos []Repository
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// Check for :pre suffix
+		trackPrereleases := false
+		if strings.HasSuffix(part, ":pre") {
+			trackPrereleases = true
+			part = strings.TrimSuffix(part, ":pre")
+		}
+
+		// Split owner/repo
+		repoParts := strings.Split(part, "/")
+		if len(repoParts) == 2 {
+			owner := strings.TrimSpace(repoParts[0])
+			name := strings.TrimSpace(repoParts[1])
+			if owner != "" && name != "" {
+				repos = append(repos, Repository{
+					Owner:            owner,
+					Name:             name,
+					TrackPrereleases: trackPrereleases,
+				})
+			}
+		}
+	}
+	return repos
 }
